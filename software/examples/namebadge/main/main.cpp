@@ -12,6 +12,10 @@
 
 #include "badge_pins.h"
 
+// Networking
+#include <WiFi.h>
+#include <HTTPClient.h>
+
 // ── I²C / buttons ─────────────────────────────────────────────────────────────
 #define TCA9534_ADDR   0x20
 #define TCA9534_INPUT  0x00
@@ -104,12 +108,14 @@ static int printStackedName(const char* name, int x, int y, uint8_t textSize) {
   return lineHeight;
 }
 
+// Added footerText parameter to allow updating bottom-right text
 static void renderBadge(const char* eventName,
                         const char* eventDetail,
                         const char* name,
                         const char* role,
                         const char* qrText,
-                        const char* tagline) {
+                        const char* tagline,
+                        const char* footerText) {
   const int leftMargin = 10;
   const int lineRight = display.width() - 10;
   const int qrSizePx = 66;
@@ -147,7 +153,75 @@ static void renderBadge(const char* eventName,
 
     display.setCursor(leftMargin, display.height() - 10);
     display.print(tagline);
+    // Draw footer (right aligned)
+    if (footerText && footerText[0] != '\0') {
+      display.setFont(&FreeMono9pt7b);
+      display.setTextSize(1);
+      int16_t bx, by;
+      uint16_t bw, bh;
+      String f = String(footerText);
+      display.getTextBounds(f, 0, 0, &bx, &by, &bw, &bh);
+      int fx = display.width() - 10 - bw;
+      int fy = display.height() - 10;
+      if (fx < leftMargin) fx = leftMargin;
+      display.setCursor(fx, fy);
+      display.print(f);
+    }
   } while (display.nextPage());
+}
+
+// --- Network / polling helpers ------------------------------------------------
+static const char* WIFI_SSID = "CIC Guest"; 
+static const char* WIFI_PASSWORD = "1nnovation";
+static const char* FOOTER_API_URL = "https://oniondao.dev/portal/__data.json";
+
+static void connectWiFi(unsigned long timeoutMs = 10000) {
+  if (WiFi.status() == WL_CONNECTED) return;
+  Serial.printf("Connecting to WiFi '%s'...\n", WIFI_SSID);
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  unsigned long start = millis();
+  while (WiFi.status() != WL_CONNECTED && (millis() - start) < timeoutMs) {
+    delay(200);
+    Serial.print('.');
+  }
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println("\nWiFi connected");
+    Serial.print("IP: ");
+    Serial.println(WiFi.localIP());
+  } else {
+    Serial.println("\nWiFi connect timeout");
+  }
+}
+
+static String fetchFooterText() {
+  HTTPClient http;
+  String result = "(no data)";
+  Serial.printf("Fetching footer from %s\n", FOOTER_API_URL);
+  http.begin(FOOTER_API_URL);
+  int httpCode = http.GET();
+  if (httpCode == HTTP_CODE_OK) {
+    String payload = http.getString();
+    payload.trim();
+    if (payload.length() > 0) {
+      // truncate to reasonable length
+      if (payload.length() > 48) payload = payload.substring(0, 48);
+      result = payload;
+    }
+  } else {
+    Serial.printf("HTTP GET failed, code: %d\n", httpCode);
+  }
+  http.end();
+  return result;
+}
+
+static void updateBadgeWithFooter(const char* footer) {
+  // Wake display, re-render full badge with new footer, then hibernate
+  display.init(115200);
+  display.setRotation(1);
+  display.setTextColor(GxEPD_BLACK);
+  renderBadge(EVENT_TITLE, EVENT_DETAIL, ATTENDEE_NAME, ATTENDEE_ROLE, QR_TEXT, BADGE_TAGLINE, footer);
+  display.hibernate();
 }
 
 void setup() {
@@ -166,12 +240,30 @@ void setup() {
   display.setRotation(1);
   display.setTextColor(GxEPD_BLACK);
 
-  renderBadge(EVENT_TITLE, EVENT_DETAIL, ATTENDEE_NAME, ATTENDEE_ROLE, QR_TEXT, BADGE_TAGLINE);
+  // Initial render with empty footer
+  renderBadge(EVENT_TITLE, EVENT_DETAIL, ATTENDEE_NAME, ATTENDEE_ROLE, QR_TEXT, BADGE_TAGLINE, "");
 
   // Put panel into low-power mode after drawing
   display.hibernate();
 }
 
 void loop() {
-  // Static text; nothing else needed
+  static unsigned long lastPoll = 0;
+  const unsigned long POLL_INTERVAL_MS = 3600000UL; // 1 hour
+
+  if (lastPoll == 0 || (millis() - lastPoll) >= POLL_INTERVAL_MS) {
+    lastPoll = millis();
+    Serial.println("Hourly tick: checking for footer update...");
+    connectWiFi(15000);
+    if (WiFi.status() == WL_CONNECTED) {
+      String footer = fetchFooterText();
+      updateBadgeWithFooter(footer.c_str());
+      WiFi.disconnect(true);
+      WiFi.mode(WIFI_OFF);
+    } else {
+      Serial.println("No WiFi: skipping footer fetch");
+    }
+  }
+
+  delay(1000);
 }
