@@ -14,7 +14,9 @@
 
 // Networking
 #include <WiFi.h>
+#include <WiFiClientSecure.h>
 #include <HTTPClient.h>
+#include <cJSON.h>
 
 // ── I²C / buttons ─────────────────────────────────────────────────────────────
 #define TCA9534_ADDR   0x20
@@ -108,14 +110,14 @@ static int printStackedName(const char* name, int x, int y, uint8_t textSize) {
   return lineHeight;
 }
 
-// Added footerText parameter to allow updating bottom-right text
+// Added walletText parameter to allow updating bottom-right text
 static void renderBadge(const char* eventName,
                         const char* eventDetail,
                         const char* name,
                         const char* role,
                         const char* qrText,
                         const char* tagline,
-                        const char* footerText) {
+                        const char* walletText) {
   const int leftMargin = 10;
   const int lineRight = display.width() - 10;
   const int qrSizePx = 66;
@@ -153,13 +155,13 @@ static void renderBadge(const char* eventName,
 
     display.setCursor(leftMargin, display.height() - 10);
     display.print(tagline);
-    // Draw footer (right aligned)
-    if (footerText && footerText[0] != '\0') {
+    // Draw wallet value (right aligned)
+    if (walletText && walletText[0] != '\0') {
       display.setFont(&FreeMono9pt7b);
       display.setTextSize(1);
       int16_t bx, by;
       uint16_t bw, bh;
-      String f = String(footerText);
+      String f = String(walletText);
       display.getTextBounds(f, 0, 0, &bx, &by, &bw, &bh);
       int fx = display.width() - 10 - bw;
       int fy = display.height() - 10;
@@ -173,10 +175,14 @@ static void renderBadge(const char* eventName,
 // --- Network / polling helpers ------------------------------------------------
 static const char* WIFI_SSID = "CIC Guest"; 
 static const char* WIFI_PASSWORD = "1nnovation";
-static const char* FOOTER_API_URL = "https://oniondao.dev/portal/__data.json";
+static const char* WALLET_API_URL = "https://oniondao.dev/portal/__data.json";
+static int currentWalletValue = 0;
 
-static void connectWiFi(unsigned long timeoutMs = 10000) {
-  if (WiFi.status() == WL_CONNECTED) return;
+static bool connectWiFi(unsigned long timeoutMs = 10000) {
+  if (WiFi.status() == WL_CONNECTED) {
+    return true;
+  }
+
   Serial.printf("Connecting to WiFi '%s'...\n", WIFI_SSID);
   WiFi.mode(WIFI_STA);
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
@@ -185,42 +191,146 @@ static void connectWiFi(unsigned long timeoutMs = 10000) {
     delay(200);
     Serial.print('.');
   }
+
   if (WiFi.status() == WL_CONNECTED) {
     Serial.println("\nWiFi connected");
     Serial.print("IP: ");
     Serial.println(WiFi.localIP());
-  } else {
-    Serial.println("\nWiFi connect timeout");
+    return true;
   }
+
+  Serial.println("\nWiFi connect timeout");
+  return false;
 }
 
-static String fetchFooterText() {
-  HTTPClient http;
-  String result = "(no data)";
-  Serial.printf("Fetching footer from %s\n", FOOTER_API_URL);
-  http.begin(FOOTER_API_URL);
-  int httpCode = http.GET();
-  if (httpCode == HTTP_CODE_OK) {
-    String payload = http.getString();
-    payload.trim();
-    if (payload.length() > 0) {
-      // truncate to reasonable length
-      if (payload.length() > 48) payload = payload.substring(0, 48);
-      result = payload;
+static bool findWalletValueNumber(cJSON *item, long &outValue) {
+  if (!item) {
+    return false;
+  }
+
+  if (cJSON_IsObject(item)) {
+    cJSON *child = item->child;
+    while (child) {
+      if (findWalletValueNumber(child, outValue)) {
+        return true;
+      }
+      child = child->next;
     }
-  } else {
-    Serial.printf("HTTP GET failed, code: %d\n", httpCode);
+    return false;
   }
-  http.end();
-  return result;
+
+  if (cJSON_IsArray(item)) {
+    cJSON *child = item->child;
+    while (child) {
+      if (cJSON_IsObject(child) && cJSON_GetObjectItemCaseSensitive(child, "lifetimeEarned")) {
+        cJSON *nextSibling = child->next;
+        if (nextSibling) {
+          if (cJSON_IsNumber(nextSibling)) {
+            outValue = (long)nextSibling->valuedouble;
+            return true;
+          }
+          if (cJSON_IsString(nextSibling) && nextSibling->valuestring != NULL) {
+            outValue = atol(nextSibling->valuestring);
+            return true;
+          }
+        }
+      }
+
+      if (findWalletValueNumber(child, outValue)) {
+        return true;
+      }
+      child = child->next;
+    }
+    return false;
+  }
+
+  return false;
 }
 
-static void updateBadgeWithFooter(const char* footer) {
-  // Wake display, re-render full badge with new footer, then hibernate
+static String extract_first_string_from_json(cJSON *item) {
+  if (!item) {
+    return String("(no data)");
+  }
+  if (cJSON_IsString(item) && item->valuestring != NULL) {
+    return String(item->valuestring);
+  }
+  if (cJSON_IsObject(item) || cJSON_IsArray(item)) {
+    cJSON *child = item->child;
+    while (child) {
+      String candidate = extract_first_string_from_json(child);
+      if (candidate.length() > 0 && candidate != "(no data)") {
+        return candidate;
+      }
+      child = child->next;
+    }
+  }
+  return String("(no data)");
+}
+
+static int fetchWalletValue() {
+  static HTTPClient http;
+  static WiFiClientSecure client;
+  client.setInsecure();
+
+  String walletValue = "(no data)";
+  Serial.printf("Fetching wallet from %s\n", WALLET_API_URL);
+
+  if (http.begin(client, WALLET_API_URL)) {
+    http.addHeader("Accept", "application/json");
+    http.addHeader("Cookie", "session=9d7144001cef771857f2682787887a4ced987fad3787e6b074eb5bcfecd7c930");
+
+    int httpCode = http.GET();
+    if (httpCode == HTTP_CODE_OK) {
+      String body = http.getString();
+      Serial.print("API response body: ");
+      Serial.println(body);
+      if (body.length() > 0) {
+        cJSON *root = cJSON_Parse(body.c_str());
+        if (root) {
+          const char *keys[] = {"wallet", "wallet_value", "onion_wallet", "text", "message", NULL};
+          for (int i = 0; keys[i]; ++i) {
+            cJSON *item = cJSON_GetObjectItemCaseSensitive(root, keys[i]);
+            if (cJSON_IsString(item) && item->valuestring != NULL) {
+              walletValue = String(item->valuestring);
+              break;
+            }
+          }
+          if (walletValue == "(no data)") {
+            long numericWallet = 0;
+            if (findWalletValueNumber(root, numericWallet)) {
+              walletValue = String(numericWallet);
+            } else {
+              Serial.println("Wallet numeric field not found in JSON");
+            }
+          }
+          Serial.print("Extracted wallet value: ");
+          Serial.println(walletValue);
+          cJSON_Delete(root);
+        } else {
+          Serial.println("Failed to parse JSON");
+        }
+      }
+    } else {
+      Serial.printf("HTTP GET failed, code: %d\n", httpCode);
+    }
+    http.end();
+  } else {
+    Serial.println("Failed to begin HTTP request");
+  }
+
+  walletValue.trim();
+
+  Serial.print("end of fetchWalletValue()");
+  Serial.println(walletValue.toInt());
+  return walletValue.toInt();
+}
+
+static void updateBadgeWithWallet(const char* wallet) {
+  // Wake display, re-render full badge with new wallet value, then hibernate
   display.init(115200);
   display.setRotation(1);
   display.setTextColor(GxEPD_BLACK);
-  renderBadge(EVENT_TITLE, EVENT_DETAIL, ATTENDEE_NAME, ATTENDEE_ROLE, QR_TEXT, BADGE_TAGLINE, footer);
+  renderBadge(EVENT_TITLE, EVENT_DETAIL, ATTENDEE_NAME, ATTENDEE_ROLE, QR_TEXT, BADGE_TAGLINE, wallet);
   display.hibernate();
 }
 
@@ -240,7 +350,7 @@ void setup() {
   display.setRotation(1);
   display.setTextColor(GxEPD_BLACK);
 
-  // Initial render with empty footer
+  // Initial render with empty wallet value
   renderBadge(EVENT_TITLE, EVENT_DETAIL, ATTENDEE_NAME, ATTENDEE_ROLE, QR_TEXT, BADGE_TAGLINE, "");
 
   // Put panel into low-power mode after drawing
@@ -250,18 +360,27 @@ void setup() {
 void loop() {
   static unsigned long lastPoll = 0;
   const unsigned long POLL_INTERVAL_MS = 3600000UL; // 1 hour
+  int wallet = 0;
 
   if (lastPoll == 0 || (millis() - lastPoll) >= POLL_INTERVAL_MS) {
     lastPoll = millis();
-    Serial.println("Hourly tick: checking for footer update...");
-    connectWiFi(15000);
-    if (WiFi.status() == WL_CONNECTED) {
-      String footer = fetchFooterText();
-      updateBadgeWithFooter(footer.c_str());
+    Serial.println("Hourly tick: checking for wallet update...");
+    if (connectWiFi(15000)) {
+      wallet = fetchWalletValue();
+      Serial.print(wallet);
+      Serial.print("fetchWalletValue()");
+      Serial.println(wallet);
+      if (wallet != currentWalletValue) {
+        currentWalletValue = wallet;
+        Serial.println("refreshing screen");
+        updateBadgeWithWallet(String(wallet).c_str());
+      } else {
+        Serial.println("Wallet unchanged or no value found; skipping redraw.");
+      }
       WiFi.disconnect(true);
       WiFi.mode(WIFI_OFF);
     } else {
-      Serial.println("No WiFi: skipping footer fetch");
+      Serial.println("No WiFi: skipping wallet fetch");
     }
   }
 

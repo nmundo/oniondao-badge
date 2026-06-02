@@ -1,7 +1,7 @@
 idf_component_register(
     SRCS "main.cpp"
     INCLUDE_DIRS "."
-    REQUIRES espressif__arduino-esp32 GxEPD2 espressif__qrcode
+    REQUIRES espressif__arduino-esp32 GxEPD2 espressif__qrcode cjson
 )
 
 # -DBOARD_HAS_PSRAM (was board_build.arduino.memory_type = qio_opi in platformio)
